@@ -47,8 +47,8 @@ pip install -r requirements.txt
 ### Clone the Project
 
 ```bash
-git clone https://github.com/abdmusleh/malware-yara-gen.git
-cd malware-yara-gen
+git clone https://github.com/abdmusleh/mcp-for-clamav.git
+cd mcp-for-clamav
 ```
 
 ---
@@ -71,7 +71,6 @@ This will:
 * Generate YARA rules
 * Save the rules into `.yara` files in the `generate_rules/` directory
 
-> We removed malware samples (`data/`) from the repo. Never expose these files publicly.
 
 ---
 
