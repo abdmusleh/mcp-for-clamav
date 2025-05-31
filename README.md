@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This project demonstrates how to enhance ClamAV's malware detection capabilities by automatically generating YARA rules from malware samples using a custom Malware Control Protocol (MCP) server.
+This project demonstrates how to enhance ClamAV's malware detection capabilities by automatically generating YARA rules from malware samples using a custom Model context Protocol (MCP) server.
 
 We scan a malware sample dataset before and after YARA rule injection, showing significant detection improvements.
 
