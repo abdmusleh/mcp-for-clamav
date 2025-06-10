@@ -1,150 +1,168 @@
-import json
+# mcp_server.py - Manual JSON-RPC over Stdio Server
+
 import sys
+import json
 import os
-import hashlib
-import subprocess
+import traceback
+import concurrent.futures
+import time # Added import for time.ctime() for logging
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-import rulegen2
+# Import the analysis and rule generation logic
+import analyzer2 
+import rulegen2 
 
-CAPA_PATH = "/usr/local/bin/capa"
-PEANALYZER_PATH = "/usr/local/bin/peanalyzer"
+# --- START OF DEBUGGING ADDITION ---
+# Define a log file for server errors
+SERVER_LOG_FILE = "/tmp/mcp_server_error.log"
 
-class MCPServer:
-    def __init__(self):
-        self.methods = {
-            "malware/analyzeSample": self.analyze_sample,
-            "yara/generateRulesFromFeatures": self.generate_rules_from_features
-        }
+def log_error_to_file(message):
+    """Writes error messages and tracebacks to a designated log file."""
+    try:
+        with open(SERVER_LOG_FILE, "a") as f:
+            f.write(f"[{time.ctime()}] ERROR: {message}\n")
+            traceback.print_exc(file=f)
+            f.write("-" * 50 + "\n\n")
+    except Exception as e:
+        # Fallback to stderr if logging to file fails
+        print(f"FATAL ERROR: Could not write to log file {SERVER_LOG_FILE}: {e}", file=sys.stderr)
+        print(message, file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
 
-    def read_request(self):
-        try:
-            line = sys.stdin.readline()
-            if not line:
-                return None
-            return json.loads(line)
-        except json.JSONDecodeError as e:
-            self.send_error(None, -32700, f"Parse error: {e}")
-            return None
-        except Exception as e:
-            self.send_error(None, -32000, f"Internal error: {e}")
-            return None
+# --- END OF DEBUGGING ADDITION ---
 
-    def send_response(self, response):
-        sys.stdout.write(json.dumps(response) + '\n')
-        sys.stdout.flush()
 
-    def send_result(self, request_id, result):
-        response = {
-            "jsonrpc": "2.0",
-            "result": result,
-            "id": request_id
-        }
-        self.send_response(response)
+def write_jsonrpc_response(response_id, result): 
+    """Formats and writes a successful JSON-RPC response to stdout."""
+    response = {
+        "jsonrpc": "2.0",
+        "id": response_id,
+        "result": result
+    }
+    print(json.dumps(response), flush=True)
 
-    def send_error(self, request_id, code, message, data=None):
-        error = {
-            "jsonrpc": "2.0",
-            "error": {
-                "code": code,
-                "message": message,
-                "data": data
-            },
-            "id": request_id
-        }
-        self.send_response(error)
+def write_jsonrpc_error(response_id, code, message, data=None):
+    """Formats and writes a JSON-RPC error response to stdout."""
+    error_obj = {"code": code, "message": message}
+    if data:
+        error_obj["data"] = data
+    response = {
+        "jsonrpc": "2.0",
+        "id": response_id,
+        "error": error_obj
+    }
+    print(json.dumps(response), flush=True)
 
-    def analyze_sample(self, params, request_id):
-        file_path = params.get("file_path")
-        if not file_path or not os.path.exists(file_path):
-            self.send_error(request_id, -32602, "Invalid params", "file_path required and must exist")
-            return
+def process_request(request_data):
+    """Processes a single JSON-RPC request dictionary."""
+    request_id = request_data.get("id")
+    method = request_data.get("method")
+    params = request_data.get("params")
 
-        features = {
-            "filename": os.path.basename(file_path),
-            "size": os.path.getsize(file_path),
-            "hash": hashlib.md5(open(file_path, 'rb').read()).hexdigest(),
-            "is_pe": False,
-            "imports": [],
-            "sections": [],
-            "strings": []
-        }
+    if not method or not isinstance(params, dict):
+        write_jsonrpc_error(request_id, -32600, "Invalid Request: Missing method or params")
+        return
 
-        # Get strings from file
-        try:
-            strings_output = subprocess.check_output(['strings', '-n', '4', file_path], timeout=30).decode('utf-8', errors='ignore')
-            features["strings"] = strings_output.splitlines()
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            sys.stderr.write(f"Warning: strings command failed for {file_path}: {e}\n")
-            features["strings"] = []
-
-        # Check if PE file
-        with open(file_path, 'rb') as f:
-            magic_bytes = f.read(2)
-            if magic_bytes == b'MZ':
-                features["is_pe"] = True
+    try:
+        if method == "malware/analyzeSample":
+            file_path = params.get("file_path")
+            if not file_path or not isinstance(file_path, str):
+                write_jsonrpc_error(request_id, -32602, "Invalid Params: Missing or invalid file_path")
+                return
             
-        # Analyze PE structure if it's a PE file
-        if features["is_pe"]:
-            try:
-                peanalyzer_cmd = [PEANALYZER_PATH, file_path]
-                peanalyzer_output = subprocess.check_output(peanalyzer_cmd, timeout=60).decode('utf-8', errors='ignore')
-                pe_analysis = json.loads(peanalyzer_output)
-
-                if pe_analysis and isinstance(pe_analysis.get("imports"), list):
-                    features["imports"] = [imp.get("name") for imp in pe_analysis["imports"] if imp.get("name")]
+            # Ensure file exists before analyzing
+            if not os.path.exists(file_path):
+                write_jsonrpc_error(request_id, -32001, f"File not found: {file_path}")
+                return
                 
-                if pe_analysis and isinstance(pe_analysis.get("sections"), list):
-                    features["sections"] = pe_analysis["sections"]
+            try:
+                # Using ProcessPoolExecutor to run analysis in a separate process with a timeout
+                with concurrent.futures.ProcessPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(analyzer2.analyze_file, file_path)
+                    result = future.result(timeout=60) # Set your desired timeout in seconds
+                write_jsonrpc_response(request_id, result)
+            except concurrent.futures.TimeoutError:
+                write_jsonrpc_error(request_id, -32002, "Analysis timed out (exceeded 60 seconds).")
+            except Exception as e:
+                error_message = f"Analysis failed: {str(e)}"
+                log_error_to_file(f"Error during analysis of {file_path} for request ID {request_id}: {error_message}") # Log to file
+                write_jsonrpc_error(request_id, -32003, error_message)
 
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                sys.stderr.write(f"Warning: peanalyzer failed for {file_path}: {e}\n")
-                features["imports"] = []
-                features["sections"] = []
-            except json.JSONDecodeError as e:
-                sys.stderr.write(f"Warning: peanalyzer output invalid JSON: {e}\n")
-                features["imports"] = []
-                features["sections"] = []
-            except FileNotFoundError:
-                sys.stderr.write(f"Error: peanalyzer not found at {PEANALYZER_PATH}\n")
-                features["is_pe"] = False
+        elif method == "yara/generateRulesFromFeatures":
+            features = params.get("features")
+            filename = params.get("filename")
+            if not features or not isinstance(features, dict) or not filename or not isinstance(filename, str):
+                write_jsonrpc_error(request_id, -32602, "Invalid Params: Missing or invalid features/filename")
+                return
+                
+            if features.get("error"):
+                write_jsonrpc_response(request_id, {"rules": []})
+                return
+                
+            # --- START OF CHANGE: Add timeout for rulegen2.create_yara_rules ---
+            try:
+                # Using ThreadPoolExecutor for rule generation as it's CPU-bound Python code
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(rulegen2.create_yara_rules, features, filename)
+                    result_rules = future.result(timeout=30) # 30 seconds timeout for rule generation
+                write_jsonrpc_response(request_id, {"rules": result_rules})
+            except concurrent.futures.TimeoutError:
+                write_jsonrpc_error(request_id, -32004, "Rule generation timed out (exceeded 30 seconds).")
+            except Exception as e:
+                error_message = f"Rule generation failed: {str(e)}"
+                log_error_to_file(f"Error during rule generation for {filename} (request ID {request_id}): {error_message}") # Log to file
+                write_jsonrpc_error(request_id, -32005, error_message)
+            # --- END OF CHANGE ---
 
-        self.send_result(request_id, features)
+        else:
+            write_jsonrpc_error(request_id, -32601, f"Method not found: {method}")
 
-    def generate_rules_from_features(self, params, request_id):
-        features = params.get("features")
-        filename = params.get("filename")
+    except Exception as e:
+        # Catch-all for unexpected errors during processing
+        error_message = f"Internal server error: {str(e)}"
+        log_error_to_file(f"Error processing request ID {request_id}: {error_message}") # Log to file
+        write_jsonrpc_error(request_id, -32603, error_message)
 
-        if not features or not filename:
-            self.send_error(request_id, -32602, "Invalid params", "features and filename required")
-            return
-
+def main_loop():
+    """Reads JSON-RPC requests from stdin and processes them."""
+    print("Manual JSON-RPC server started. Listening on stdin...", file=sys.stderr, flush=True)
+    # Ensure log file is clear at startup for a fresh run
+    if os.path.exists(SERVER_LOG_FILE):
         try:
-            rules, imports = rulegen2.create_yara_rules(features, filename)
-            self.send_result(request_id, {"rules": rules, "imports": list(imports)})
+            os.remove(SERVER_LOG_FILE)
+        except OSError as e:
+            print(f"Warning: Could not remove old log file {SERVER_LOG_FILE}: {e}", file=sys.stderr, flush=True)
+    
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+            
+        # print(f"Received line: {line}", file=sys.stderr, flush=True) # Debug log - keep if useful, otherwise remove
+        request_id = None
+        try:
+            request_data = json.loads(line)
+            if not isinstance(request_data, dict):
+                raise ValueError("Request must be a JSON object")
+                    
+            request_id = request_data.get("id")
+            
+            if request_data.get("jsonrpc") != "2.0":
+                write_jsonrpc_error(request_id, -32600, "Invalid Request: Missing or invalid jsonrpc version")
+                continue
+                
+            process_request(request_data)
+            
+        except json.JSONDecodeError:
+            error_message = f"Failed to decode JSON: {line}"
+            log_error_to_file(f"JSON Decode Error: {error_message}") # Log to file
+            write_jsonrpc_error(request_id, -32700, error_message)
         except Exception as e:
-            self.send_error(request_id, -32000, f"Error generating YARA rules: {e}", str(e))
-
-    def run(self):
-        sys.stderr.write("JSON-RPC server starting...\n")
-        while True:
-            request = self.read_request()
-            if request is None:
-                sys.stderr.write("Server shutting down\n")
-                break
-
-            method = request.get("method")
-            params = request.get("params")
-            request_id = request.get("id")
-
-            if method in self.methods:
-                try:
-                    self.methods[method](params, request_id)
-                except Exception as e:
-                    self.send_error(request_id, -32000, f"Server error: {e}", str(e))
-            else:
-                self.send_error(request_id, -32601, "Method not found")
+            # Catch errors during the request processing setup (before process_request)
+            error_message = f"Server error handling request: {str(e)}"
+            log_error_to_file(f"General Server Error for line '{line}': {error_message}") # Log to file
+            write_jsonrpc_error(request_id, -32603, error_message)
+            
+    print("Stdin closed. Server shutting down.", file=sys.stderr, flush=True)
 
 if __name__ == "__main__":
-    server = MCPServer()
-    server.run()
+    main_loop()
